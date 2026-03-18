@@ -1,88 +1,211 @@
+"""
+PawPal+ Streamlit UI — connects directly to the pawpal_system logic layer.
+AI feature: Claude explains the generated schedule via the Anthropic API.
+"""
+import os
 import streamlit as st
+from datetime import date, timedelta
+import anthropic
+
+from pawpal_system import Task, Pet, Owner, Scheduler
+
+# ── Page config ────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
-
 st.title("🐾 PawPal+")
+st.caption("Smart pet care scheduling — now with AI-powered explanations.")
 
-st.markdown(
-    """
-Welcome to the PawPal+ starter app.
+# ── Session state bootstrap ────────────────────────────────────────────────────
+# Streamlit reruns the script on every interaction, so we persist the Owner
+# object (and therefore all pets + tasks) in st.session_state.
 
-This file is intentionally thin. It gives you a working Streamlit app so you can start quickly,
-but **it does not implement the project logic**. Your job is to design the system and build it.
+if "owner" not in st.session_state:
+    st.session_state.owner = None
 
-Use this app as your interactive demo once your backend classes/functions exist.
-"""
-)
+# ── Sidebar: owner setup ───────────────────────────────────────────────────────
 
-with st.expander("Scenario", expanded=True):
-    st.markdown(
-        """
-**PawPal+** is a pet care planning assistant. It helps a pet owner plan care tasks
-for their pet(s) based on constraints like time, priority, and preferences.
+with st.sidebar:
+    st.header("Owner Setup")
+    owner_name = st.text_input("Owner name", value="Jordan")
+    if st.button("Set / Reset Owner"):
+        st.session_state.owner = Owner(name=owner_name)
+        st.success(f"Owner set to {owner_name}")
 
-You will design and implement the scheduling logic and connect it to this Streamlit UI.
-"""
-    )
+    if st.session_state.owner:
+        st.divider()
+        st.header("Add a Pet")
+        pet_name = st.text_input("Pet name", key="pet_name")
+        species = st.selectbox("Species", ["dog", "cat", "bird", "other"], key="species")
+        if st.button("Add Pet"):
+            if pet_name.strip():
+                st.session_state.owner.add_pet(Pet(name=pet_name.strip(), species=species))
+                st.success(f"Added {pet_name} ({species})")
+            else:
+                st.error("Pet name cannot be empty.")
 
-with st.expander("What you need to build", expanded=True):
-    st.markdown(
-        """
-At minimum, your system should:
-- Represent pet care tasks (what needs to happen, how long it takes, priority)
-- Represent the pet and the owner (basic info and preferences)
-- Build a plan/schedule for a day that chooses and orders tasks based on constraints
-- Explain the plan (why each task was chosen and when it happens)
-"""
-    )
+# ── Guard: require owner ───────────────────────────────────────────────────────
 
-st.divider()
+if st.session_state.owner is None:
+    st.info("Set an owner name in the sidebar to get started.")
+    st.stop()
 
-st.subheader("Quick Demo Inputs (UI only)")
-owner_name = st.text_input("Owner name", value="Jordan")
-pet_name = st.text_input("Pet name", value="Mochi")
-species = st.selectbox("Species", ["dog", "cat", "other"])
+owner: Owner = st.session_state.owner
 
-st.markdown("### Tasks")
-st.caption("Add a few tasks. In your final version, these should feed into your scheduler.")
+# ── Add Tasks ──────────────────────────────────────────────────────────────────
 
-if "tasks" not in st.session_state:
-    st.session_state.tasks = []
+st.subheader("Add a Task")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    task_title = st.text_input("Task title", value="Morning walk")
-with col2:
-    duration = st.number_input("Duration (minutes)", min_value=1, max_value=240, value=20)
-with col3:
-    priority = st.selectbox("Priority", ["low", "medium", "high"], index=2)
-
-if st.button("Add task"):
-    st.session_state.tasks.append(
-        {"title": task_title, "duration_minutes": int(duration), "priority": priority}
-    )
-
-if st.session_state.tasks:
-    st.write("Current tasks:")
-    st.table(st.session_state.tasks)
+if not owner.pets:
+    st.warning("Add at least one pet (sidebar) before scheduling tasks.")
 else:
-    st.info("No tasks yet. Add one above.")
+    col1, col2 = st.columns(2)
+    with col1:
+        target_pet = st.selectbox("For pet", [p.name for p in owner.pets])
+        task_desc = st.text_input("Task description", value="Morning walk")
+        task_time = st.text_input("Time (HH:MM)", value="08:00")
+    with col2:
+        duration = st.number_input("Duration (min)", min_value=1, max_value=240, value=20)
+        priority = st.selectbox("Priority", ["low", "medium", "high"], index=2)
+        frequency = st.selectbox("Frequency", ["once", "daily", "weekly"])
+        due = st.date_input("Due date", value=date.today())
+
+    if st.button("Add Task"):
+        # Validate HH:MM
+        try:
+            h, m = task_time.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except Exception:
+            st.error("Time must be in HH:MM format (e.g. 08:30).")
+        else:
+            new_task = Task(
+                description=task_desc.strip(),
+                time=task_time,
+                duration_minutes=int(duration),
+                priority=priority,
+                frequency=frequency,
+                due_date=due,
+            )
+            for pet in owner.pets:
+                if pet.name == target_pet:
+                    pet.add_task(new_task)
+                    st.success(f"Task '{task_desc}' added to {target_pet}.")
+                    break
+
+# ── Current task table ─────────────────────────────────────────────────────────
 
 st.divider()
+st.subheader("All Tasks")
 
-st.subheader("Build Schedule")
-st.caption("This button should call your scheduling logic once you implement it.")
+all_tasks = owner.get_all_tasks()
+if not all_tasks:
+    st.info("No tasks yet.")
+else:
+    rows = [
+        {
+            "Pet": p,
+            "Description": t.description,
+            "Time": t.time,
+            "Duration": f"{t.duration_minutes}min",
+            "Priority": t.priority,
+            "Frequency": t.frequency,
+            "Due": str(t.due_date),
+            "Done": t.completed,
+        }
+        for p, t in all_tasks
+    ]
+    st.table(rows)
 
-if st.button("Generate schedule"):
-    st.warning(
-        "Not implemented yet. Next step: create your scheduling logic (classes/functions) and call it here."
-    )
-    st.markdown(
-        """
-Suggested approach:
-1. Design your UML (draft).
-2. Create class stubs (no logic).
-3. Implement scheduling behavior.
-4. Connect your scheduler here and display results.
-"""
-    )
+# ── Mark complete ──────────────────────────────────────────────────────────────
+
+if all_tasks:
+    st.subheader("Mark Task Complete")
+    incomplete = [(p, t) for p, t in all_tasks if not t.completed]
+    if incomplete:
+        options = {f"{p} — {t.time} {t.description}": (p, t) for p, t in incomplete}
+        chosen_label = st.selectbox("Select task to complete", list(options.keys()))
+        if st.button("Mark Complete"):
+            pet_name, task = options[chosen_label]
+            scheduler = Scheduler(owner)
+            scheduler.mark_task_complete(pet_name, task)
+            if task.frequency in ("daily", "weekly"):
+                delta = timedelta(days=1) if task.frequency == "daily" else timedelta(weeks=1)
+                st.success(
+                    f"Done! Next '{task.description}' scheduled for {task.due_date + delta}."
+                )
+            else:
+                st.success(f"'{task.description}' marked complete.")
+    else:
+        st.success("All tasks are complete!")
+
+# ── Generate Schedule ──────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Generate Today's Schedule")
+
+if st.button("Build Schedule"):
+    scheduler = Scheduler(owner)
+    schedule = scheduler.get_todays_schedule()
+    conflicts = scheduler.detect_conflicts()
+
+    if not schedule:
+        st.info("No pending tasks for today.")
+    else:
+        # Display sorted schedule as a clean table
+        st.success(f"Schedule built — {len(schedule)} task(s) pending.")
+        rows = [
+            {
+                "Time": t.time,
+                "Pet": p,
+                "Task": t.description,
+                "Duration": f"{t.duration_minutes}min",
+                "Priority": t.priority,
+                "Frequency": t.frequency,
+            }
+            for p, t in schedule
+        ]
+        st.table(rows)
+
+        # Conflict warnings
+        if conflicts:
+            for c in conflicts:
+                st.warning(f"⚠ {c}")
+        else:
+            st.success("No scheduling conflicts detected.")
+
+        # ── AI Explanation (Claude) ────────────────────────────────────────────
+        st.subheader("AI Schedule Explanation")
+        plan_text = scheduler.generate_plan_text()
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            st.info(
+                "Set the `ANTHROPIC_API_KEY` environment variable to enable "
+                "AI-powered schedule explanations."
+            )
+        else:
+            with st.spinner("Asking Claude to explain the schedule..."):
+                try:
+                    client = anthropic.Anthropic(api_key=api_key)
+                    message = client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=512,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"You are a helpful pet care assistant. "
+                                    f"Here is today's schedule for a pet owner:\n\n"
+                                    f"{plan_text}\n\n"
+                                    f"In 3–5 sentences, explain why this ordering makes sense "
+                                    f"for the pets' wellbeing, and flag any concerns you notice."
+                                ),
+                            }
+                        ],
+                    )
+                    explanation = message.content[0].text
+                    st.markdown("**Claude's take:**")
+                    st.info(explanation)
+                except anthropic.AuthenticationError:
+                    st.error("Invalid API key. Check your ANTHROPIC_API_KEY.")
+                except Exception as e:
+                    st.error(f"AI explanation failed: {e}")
